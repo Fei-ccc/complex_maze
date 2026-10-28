@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>复杂迷宫｜机器人最小闭环Demo</title>
+<style>
+*{box-sizing:border-box;font-family:system-ui}
+body{margin:12px;display:flex;gap:14px}
+#simPanel{flex:2}
+#ctrlPanel{flex:1;min-width:340px}
+canvas{border:2px solid #333;background:#f8f8f8}
+.chart-canvas{margin-top:8px;border:1px solid #aaa;background:#fff}
+.box{border:1px solid #ccc;padding:10px;margin-bottom:10px;border-radius:6px}
+.slide-row{margin:6px 0}
+textarea{width:100%;height:130px;font-size:11px}
+button{padding:6px 11px;margin:2px}
+</style>
+</head>
+<body>
+<div id="simPanel">
+  <h3>复杂迷宫二维仿真（A*路径规划 + PID轨迹跟踪）</h3>
+  <canvas id="simCanvas" width="600" height="480"></canvas>
+  <h4>跟踪误差曲线</h4>
+  <canvas id="errChart" class="chart-canvas" width="600" height="160"></canvas>
+</div>
+
+<div id="ctrlPanel">
+<div class="box">
+  <h4>PID与传感器参数</h4>
+  <div class="slide-row">Kp:<input type="range" id="slKp" min="0" max="4" step="0.05" value="1.7"> <span id="vKp">1.70</span></div>
+  <div class="slide-row">Ki:<input type="range" id="slKi" min="0" max="1" step="0.01" value="0.03"> <span id="vKi">0.03</span></div>
+  <div class="slide-row">Kd:<input type="range" id="slKd" min="0" max="2.5" step="0.01" value="0.65"> <span id="vKd">0.65</span></div>
+  <div class="slide-row">传感器噪声:<input type="range" id="slNoise" min="0" max="18" step="0.5" value="2.5"> <span id="vNoise">2.5</span></div>
+  <div>
+    <button id="btnPlan">重新规划路径</button>
+    <button id="btnStart">启动仿真</button>
+    <button id="btnPause">暂停</button>
+    <button id="btnReset">重置</button>
+  </div>
+</div>
+
+<div class="box">
+  <h4>State / Action / Reward / Return</h4>
+  <textarea id="logBox" readonly></textarea>
+  <p>累计回报 Return = <span id="retVal">0.00</span></p>
+</div>
+
+<div class="box">
+  <h4>闭环流程：感知→决策→执行→反馈</h4>
+<p>1.感知：读取机器人真实位姿，叠加传感器噪声得到观测位置</p>
+<p>2.决策：A*做全局路径规划；PID控制器跟踪路径点输出动作Action</p>
+<p>3.执行：控制机器人移动，在迷宫中运动</p>
+<p>4.反馈：计算跟踪误差、奖励，记录状态，绘制误差曲线循环</p>
+<p>蓝色方块=机器人；绿色圆点=路径点；红色=迷宫墙；黄色=终点</p>
+</div>
+</div>
+
+<script>
+const simC=document.getElementById('simCanvas');
+const simCtx=simC.getContext('2d');
+const chartC=document.getElementById('errChart');
+const chartCtx=chartC.getContext('2d');
+
+const slKp=document.getElementById('slKp'),vKp=document.getElementById('vKp');
+const slKi=document.getElementById('slKi'),vKi=document.getElementById('vKi');
+const slKd=document.getElementById('slKd'),vKd=document.getElementById('vKd');
+const slNoise=document.getElementById('slNoise'),vNoise=document.getElementById('vNoise');
+const btnPlan=document.getElementById('btnPlan');
+const btnStart=document.getElementById('btnStart');
+const btnPause=document.getElementById('btnPause');
+const btnReset=document.getElementById('btnReset');
+const logBox=document.getElementById('logBox');
+const retVal=document.getElementById('retVal');
+
+const CELL=40;
+const COLS=15;
+const ROWS=12;
+
+//=========更加复杂的迷宫地图 1=墙 0=通路=========
+let maze=[
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+[1,0,0,0,1,0,0,0,1,0,0,0,0,0,1],
+[1,0,1,0,1,0,1,0,1,0,1,1,1,0,1],
+[1,0,1,0,0,0,1,0,0,0,0,0,1,0,1],
+[1,0,1,1,1,0,1,1,1,1,1,0,1,0,1],
+[1,0,0,0,1,0,0,0,0,0,1,0,0,0,1],
+[1,1,1,0,1,1,1,1,1,0,1,1,1,0,1],
+[1,0,0,0,0,0,0,0,1,0,0,0,0,0,1],
+[1,0,1,1,1,1,1,0,1,1,1,1,1,0,1],
+[1,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+];
+
+const startCell={x:1,y:1};
+const goalCell={x:13,y:9};
+
+let robot={
+    x: startCell.x*CELL+CELL/2,
+    y: startCell.y*CELL+CELL/2
+};
+let simRunning=false;
+let pid={kp:1.7,ki:0.03,kd:0.65,integral:0,prevErr:0};
+let noiseMag=2.5;
+let returnSum=0.0;
+let logList=[];
+let errHistory=[];
+let frameId=null;
+
+let pathPoints=[];
+let targetPathIndex=0;
+
+function syncSliderUI(){
+    pid.kp=parseFloat(slKp.value);vKp.textContent=pid.kp.toFixed(2);
+    pid.ki=parseFloat(slKi.value);vKi.textContent=pid.ki.toFixed(2);
+    pid.kd=parseFloat(slKd.value);vKd.textContent=pid.kd.toFixed(2);
+    noiseMag=parseFloat(slNoise.value);vNoise.textContent=noiseMag.toFixed(1);
+}
+[slKp,slKi,slKd,slNoise].forEach(s=>s.oninput=syncSliderUI);
+
+function addNoise(val,mag){
+    const r1=Math.random(),r2=Math.random();
+    const gauss=Math.sqrt(-2*Math.log(r1))*Math.cos(2*Math.PI*r2);
+    return val + mag*gauss;
+}
+
+//稳定版A*
+function aStar(start,goal,mazeMap){
+    const key=p=>`${p.x},${p.y}`;
+    const dirs=[{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+    const h=(a,b)=>Math.abs(a.x-b.x)+Math.abs(a.y-b.y);
+
+    const open=[ {x:start.x,y:start.y,g:0,f:h(start,goal)} ];
+    const cameFrom=new Map();
+    const gScore=new Map();
+    gScore.set(key(start),0);
+
+    while(open.length>0){
+        let minIdx=0;
+        for(let i=0;i<open.length;i++){
+            if(open[i].f < open[minIdx].f) minIdx=i;
+        }
+        const current=open.splice(minIdx,1)[0];
+
+        if(current.x===goal.x && current.y===goal.y){
+            let curr=current;
+            const res=[];
+            while(cameFrom.has(key(curr))){
+                res.unshift({x:curr.x,y:curr.y});
+                curr=cameFrom.get(key(curr));
+            }
+            res.unshift({x:start.x,y:start.y});
+            return res;
+        }
+
+        for(const d of dirs){
+            const nx=current.x+d.x;
+            const ny=current.y+d.y;
+            if(nx<0||ny<0||nx>=COLS||ny>=ROWS) continue;
+            if(mazeMap[ny][nx]===1) continue;
+
+            const tentativeG = gScore.get(key(current)) + 1;
+            const nk=`${nx},${ny}`;
+
+            if(!gScore.has(nk) || tentativeG < gScore.get(nk)){
+                cameFrom.set(nk,current);
+                gScore.set(nk,tentativeG);
+                const fval = tentativeG + h({x:nx,y:ny},goal);
+                open.push({x:nx,y:ny,g:tentativeG,f:fval});
+            }
+        }
+    }
+    return [];
+}
+
+function planPath(){
+    const cellPath = aStar(startCell,goalCell,maze);
+    pathPoints = cellPath.map(p=>({
+        x:p.x*CELL+CELL/2,
+        y:p.y*CELL+CELL/2
+    }));
+    targetPathIndex=0;
+    console.log("规划路径点数量：",pathPoints.length);
+}
+
+function pidCalc(err){
+    pid.integral += err;
+    const diff = err - pid.prevErr;
+    const action = pid.kp*err + pid.ki*pid.integral + pid.kd*diff;
+    pid.prevErr = err;
+    return action;
+}
+
+function getReward(dist){
+    return Math.max(-8, 18 - dist*0.8);
+}
+
+function drawScene(){
+    simCtx.clearRect(0,0,simC.width,simC.height);
+    for(let y=0;y<ROWS;y++){
+        for(let x=0;x<COLS;x++){
+            if(maze[y][x]===1){
+                simCtx.fillStyle="#772222";
+                simCtx.fillRect(x*CELL,y*CELL,CELL,CELL);
+            }
+        }
+    }
+    simCtx.fillStyle="#27ae60";
+    for(const pt of pathPoints){
+        simCtx.beginPath();
+        simCtx.arc(pt.x,pt.y,4,0,2*Math.PI);
+        simCtx.fill();
+    }
+    simCtx.fillStyle="#ffcc00";
+    simCtx.beginPath();
+    simCtx.arc(goalCell.x*CELL+CELL/2,goalCell.y*CELL+CELL/2,10,0,2*Math.PI);
+    simCtx.fill();
+
+    simCtx.fillStyle="#2980b9";
+    simCtx.fillRect(robot.x-9,robot.y-9,18,18);
+}
+
+function drawErrorChart(){
+    chartCtx.clearRect(0,0,chartC.width,chartC.height);
+    const w=chartC.width,h=chartC.height;
+    chartCtx.strokeStyle="#aaa";
+    chartCtx.beginPath();chartCtx.moveTo(0,h/2);chartCtx.lineTo(w,h/2);chartCtx.stroke();
+    if(errHistory.length<2) return;
+    chartCtx.strokeStyle="#c0392b";
+    chartCtx.beginPath();
+    const maxShow=100;
+    const take=errHistory.slice(-maxShow);
+    const scaleY=1.8;
+    take.forEach((e,i)=>{
+        const x = i*(w/maxShow);
+        const y = h/2 - e*scaleY;
+        i===0 ? chartCtx.moveTo(x,y):chartCtx.lineTo(x,y);
+    });
+    chartCtx.stroke();
+}
+
+function stepFrame(){
+    if(pathPoints.length===0) return;
+
+    //【1感知】
+    const obsX=addNoise(robot.x,noiseMag);
+    const obsY=addNoise(robot.y,noiseMag);
+
+    const targetPt=pathPoints[targetPathIndex];
+    const dx=targetPt.x - obsX;
+    const dy=targetPt.y - obsY;
+    const err=Math.hypot(dx,dy);
+
+    if(err < 12 && targetPathIndex < pathPoints.length-1){
+        targetPathIndex+=1;
+    }
+
+    //【2决策 PID】
+    const actionX=pidCalc(dx);
+    const actionY=pidCalc(dy);
+
+    //【3执行】
+    robot.x += actionX * 0.032;
+    robot.y += actionY * 0.032;
+
+    //【4反馈】
+    const realDist=Math.hypot(robot.x-targetPt.x,robot.y-targetPt.y);
+    const reward=getReward(realDist);
+    returnSum += reward;
+
+    const state=`rx=${robot.x.toFixed(1)},ry=${robot.y.toFixed(1)},pidx=${targetPathIndex}`;
+    const rec={
+        state:state,
+        action:`ax=${actionX.toFixed(2)},ay=${actionY.toFixed(2)}`,
+        reward:reward.toFixed(2),
+        return:returnSum.toFixed(2)
+    };
+    logList.push(rec);
+    if(logList.length>120) logList.shift();
+    logBox.value=logList.map(r=>
+`State:${r.state} | Action:${r.action} | Reward:${r.reward} | Return:${r.return}`
+    ).join("\n");
+    retVal.textContent=returnSum.toFixed(2);
+
+    errHistory.push(err);
+    if(errHistory.length>220) errHistory.shift();
+
+    drawScene();
+    drawErrorChart();
+}
+
+function loop(){
+    if(!simRunning) return;
+    stepFrame();
+    frameId=requestAnimationFrame(loop);
+}
+
+function resetAll(){
+    robot={
+        x: startCell.x*CELL+CELL/2,
+        y: startCell.y*CELL+CELL/2
+    };
+    pid.integral=0;pid.prevErr=0;
+    returnSum=0;
+    logList=[];errHistory=[];
+    logBox.value="";
+    retVal.textContent="0.00";
+    simRunning=false;
+    if(frameId) cancelAnimationFrame(frameId);
+    planPath();
+    drawScene();
+    drawErrorChart();
+}
+
+btnPlan.onclick=()=>{ planPath(); drawScene(); };
+btnStart.onclick=()=>{ if(!simRunning){ simRunning=true; loop(); }};
+btnPause.onclick=()=>{ simRunning=false; };
+btnReset.onclick=resetAll;
+
+syncSliderUI();
+resetAll();
+</script>
+</body>
+</html>
